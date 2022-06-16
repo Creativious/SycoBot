@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 
-"""Basic Setup"""
+""" Basic Setup """
 
 loginToken = ""
 with open("token.txt", "r") as f:
