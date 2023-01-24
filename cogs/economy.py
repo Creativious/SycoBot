@@ -1,15 +1,23 @@
 import asyncio
+import datetime
+import math
 from abc import ABC, abstractmethod
 from typing import Dict
 
+import discord
 from discord.ext import commands
 import pickle
 import time
 from os import path
+import random
 from creativiousUtilities.memory import SelfPurgingObject
 from asyncio.windows_events import ProactorEventLoop
 from asyncio.events import AbstractEventLoop
 import json
+
+from extra.bot_client import CustomBotClient
+from extra.guild_manager import GuildConfig
+
 
 class Item:
     def __init__(self, name: str, worth: int):
@@ -24,23 +32,59 @@ class Item:
 class Player(SelfPurgingObject, ABC):
     def __init__(self, discord_id: int, player_manager, event_loop: ProactorEventLoop | AbstractEventLoop, time_till_purge_in_seconds: int):
         super().__init__(time_till_purge_in_seconds=time_till_purge_in_seconds, event_loop=event_loop)
-        self.coins = 0
+        self.credits = 0
         self.discord_id = discord_id
         self.player_manager = player_manager
 
-    def set_coins(self, i: int):
+        self.last_message_time_as_int = 0
+        self.joined_vc_at_time_as_int = None
+        self.last_time_daily_was_used = 0
+
+    def set_credits(self, i: int):
         self.reset_timer()
-        self.coins = i
+        self.credits = i
 
-    def add_coins(self, i: int):
-        self.set_coins(self.coins + i)
-    def remove_coins(self, i: int):
-        self.set_coins(self.coins - i)
+    def reset_daily_timer(self):
+        self.reset_timer()
+        self.last_time_daily_was_used = time.time()
 
-    def remove_coins_if_enough(self, i: int):
+    def get_daily_time(self):
+        self.reset_timer(False)
+        return self.last_time_daily_was_used
+
+    def reset_joined_vc_time(self, wipe: bool = False):
+        self.reset_timer()
+        if wipe:
+            self.joined_vc_at_time_as_int = None
+        else:
+            self.joined_vc_at_time_as_int = time.time()
+
+    def get_joined_vc_time(self):
+        self.reset_timer(False)
+        return self.joined_vc_at_time_as_int
+
+    def reset_last_message_time(self):
+        self.last_message_time_as_int = time.time()
+        self.reset_timer()
+
+    def get_last_message_time(self):
+        self.reset_timer(False)
+        return self.last_message_time_as_int
+
+
+    def add_credits(self, i: int):
+        self.set_credits(self.credits + i)
+    def remove_credits(self, i: int):
+        self.set_credits(self.credits - i)
+
+    def get_credits(self):
+        self.reset_timer(False)
+        return self.credits
+
+    def remove_credits_if_enough(self, i: int):
         """Returns a boolean, true if the player had enough and the amount was removed and false if they didn't have enough and nothing was removed"""
-        if self.coins - i >= i:
-            self.remove_coins(i)
+        if self.credits - i >= i:
+            self.remove_credits(i)
             return True
         else:
             self.reset_timer()
@@ -69,9 +113,18 @@ class Player(SelfPurgingObject, ABC):
     def __setstate__(self, state):
         self.__dict__.update(state)
 
+        # SOLVES CLASS BEING UPDATED AND PICKLE THROWING A FIT
+        current_dict = self.__dict__.copy()
+        self.__init__(self.discord_id, self.player_manager, self.event_loop, self.purge_time_delay)
+        self.__dict__.update(current_dict)
+
+
     def after_load(self, event_loop: ProactorEventLoop | AbstractEventLoop, player_manager):
         self.setup_part_2(event_loop)
         self.player_manager = player_manager
+
+
+
 
 class PlayerManager:
     def __init__(self, event_loop: ProactorEventLoop | AbstractEventLoop):
@@ -85,7 +138,7 @@ class PlayerManager:
         player: Player
         with open(f"{path.join('data/players/', str(discord_id) + '.player')}", "rb") as f:
             player = pickle.load(f)
-        player.after_load(self.event_loop, self)
+        player.after_load(event_loop=self.event_loop, player_manager=self)
         self.loaded_players[str(discord_id)] = player
         return player
 
@@ -127,7 +180,80 @@ class PlayerManager:
 
 
 class Economy(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.event_loop = asyncio.get_event_loop()
-        self.player_manager = PlayerManager(self.event_loop)
+
+    def __init__(self, bot: CustomBotClient):
+        self.bot: CustomBotClient = bot
+        self.player_manager: PlayerManager = PlayerManager(self.bot.event_loop)
+
+    @discord.Cog.listener()
+    async def on_message(self, message: discord.Message):
+
+        if message.author.id != self.bot.user.id and not message.author.bot:
+            guild_config: GuildConfig = self.bot.guild_manager.get_guild_config(message.guild.id)
+            if guild_config.economy_functionality_for_guild.data:
+                player: Player = self.player_manager.get_player(message.author.id)
+
+                if player.get_last_message_time() <= time.time() - 60: # Messages older than one minute
+                    reward_amount = random.randint(1, 10)
+                    self.player_manager.get_player(message.author.id).add_credits(reward_amount)
+                    self.player_manager.get_player(message.author.id).reset_last_message_time()
+
+    @discord.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+
+        if member.id != self.bot.user.id and not member.bot:
+            guild_config: GuildConfig = self.bot.guild_manager.get_guild_config(member.guild.id)
+            if guild_config.economy_functionality_for_guild.data:
+                if before.channel != after.channel:
+                    time_elapsed = 0
+                    player: Player = self.player_manager.get_player(member.id)
+                    if after.channel is not None and before.channel is None:
+                        player.reset_joined_vc_time()
+                    elif after.channel is not None and before.channel is not None and player.get_joined_vc_time() is not None:
+                        time_elapsed = time.time() - player.get_joined_vc_time()
+                        player.reset_joined_vc_time()
+                    elif after.channel is None and before.channel is not None and player.get_joined_vc_time() is not None:
+                        time_elapsed = time.time() - player.get_joined_vc_time()
+                        player.reset_joined_vc_time(True)
+                    else:
+                        player.reset_joined_vc_time(True)
+                        reward_amount = random.randint(1, 5) # Pity reward for when we didn't catch it
+                        print(f"{member.name} ({member.id}) got a pity reward of {reward_amount}")
+
+                    if time_elapsed != 0 and time_elapsed >= 900: # 900 seconds or 15 minutes
+                        reward_times = math.floor(time_elapsed / 900)
+                        reward_amount = 0
+                        i = 0
+                        while i < reward_times:
+                            reward_amount += random.randint(3, 10)
+                            i += 1
+                        self.player_manager.get_player(member.id).add_credits(reward_amount)
+
+    @discord.slash_command(description="Gives your balance or the person mentioned balance")
+    async def bal(self, ctx: discord.ApplicationContext, *, member: discord.Member = None):
+        if member is None:
+            player: Player = self.player_manager.get_player(ctx.author.id)
+            await ctx.interaction.response.send_message(
+                    f"Your balance is `{player.get_credits()}`", ephemeral=True)
+        else:
+            if not member.bot:
+                player: Player = self.player_manager.get_player(member.id)
+                await ctx.interaction.response.send_message(
+                    f"{member.name}'s balance is `{player.get_credits()}`", ephemeral=True)
+            else:
+                await ctx.interaction.response.send_message("Sorry you can't get the balance of a bot, please try it on an actual person!", ephemeral=True)
+
+    @discord.slash_command(description="Gives you your daily allowance!")
+    async def daily(self, ctx: discord.ApplicationContext):
+        player: Player = self.player_manager.get_player(ctx.author.id)
+        daily_timer = 86400 # 1 Day
+        if player.get_daily_time() <= time.time() - daily_timer:
+            player.reset_daily_timer()
+            reward_amount = random.randint(50, 100) # Maybe will raise this later but not now
+            player.add_credits(reward_amount)
+            await ctx.interaction.response.send_message(
+                f"You've been awarded `{reward_amount}` credits!", ephemeral=True)
+        else:
+            time_left = player.get_daily_time() - (time.time() - daily_timer)
+            await ctx.interaction.response.send_message(
+                f"{round(time_left)} seconds left till you can use daily again (*note from dev* : Going to make this more user readable soon)", ephemeral=True)
